@@ -7,7 +7,13 @@ import { onScopeDispose, ref, shallowRef, type Ref } from 'vue'
 import { db, ROW_REVISION } from '@/utils/db'
 import { createId } from '@/utils/uuid'
 
-export type IdbRecord = { id: string; createdAt?: number; updatedAt?: number }
+export type IdbRecord = {
+  id: string
+  revision?: number
+  createdAt?: number
+  updatedAt?: number
+  reviewStatus?: string
+}
 
 export interface UseIdbTableOptions<T extends IdbRecord> {
   /** 结果排序器，默认按 updatedAt 倒序 */
@@ -29,7 +35,7 @@ export interface UseIdbTableResult<T extends IdbRecord> {
   getById: (id: string) => Promise<T | undefined>
   create: (payload: NewRecord<T>, idPrefix?: string) => Promise<T>
   update: (id: string, patch: Partial<T>) => Promise<void>
-  upsert: (row: T) => Promise<void>
+  upsert: (row: T) => Promise<T>
   remove: (id: string) => Promise<void>
   bulkPut: (list: T[]) => Promise<void>
   clear: () => Promise<void>
@@ -76,18 +82,44 @@ export function useIdbTable<T extends IdbRecord>(
       id: payload.id ?? createId(idPrefix),
       revision: ROW_REVISION,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      reviewStatus: '正常'
     } as unknown as T
     await table.put(record)
     return record
   }
 
   const update = async (id: string, patch: Partial<T>): Promise<void> => {
-    await table.update(id, { ...patch, updatedAt: Date.now() } as never)
+    // 读出现值整体写回并自增修订号，保证多窗口能观察到最新版本
+    const current = await table.get(id)
+    if (!current) return
+    await table.put({
+      ...current,
+      ...patch,
+      revision: (typeof (current as { revision?: number }).revision === 'number'
+        ? (current as { revision: number }).revision
+        : 0) + 1,
+      updatedAt: Date.now()
+    })
   }
 
-  const upsert = async (row: T): Promise<void> => {
-    await table.put({ ...row, updatedAt: Date.now() } as T)
+  const upsert = async (row: T): Promise<T> => {
+    const now = Date.now()
+    const existing = await table.get(row.id)
+    const baseRevision =
+      existing && typeof (existing as { revision?: number }).revision === 'number'
+        ? (existing as { revision: number }).revision + 1
+        : ROW_REVISION
+    const record = {
+      ...(existing ?? {}),
+      ...row,
+      revision: baseRevision,
+      createdAt: existing ? (existing as { createdAt?: number }).createdAt ?? now : now,
+      reviewStatus: existing ? (existing as { reviewStatus?: string }).reviewStatus ?? '正常' : '正常',
+      updatedAt: now
+    } as unknown as T
+    await table.put(record)
+    return record
   }
 
   if (options.immediate !== false) {

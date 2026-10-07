@@ -44,6 +44,18 @@ function occupancyOf(tankId: string): BatchRow | null {
   return store.occupancyOf(tankId, batches.value)
 }
 
+/** 该罐当前在罐量（按批次入罐量实时计算，罐容量或入罐量一改立即重算） */
+function occupiedVolumeOf(tankId: string): number {
+  return batches.value
+    .filter((batch) => batch.tankId === tankId && batch.state !== '已出罐')
+    .reduce((sum, batch) => sum + batch.volumeL, 0)
+}
+
+/** 在罐量是否超过罐容量（容量被改小后的超载重算结果） */
+function isOverloaded(tank: TankRow): boolean {
+  return occupiedVolumeOf(tank.id) > tank.capacityL
+}
+
 function batchLabel(batch: BatchRow | null): string {
   if (!batch) return '—'
   const parcel = parcels.value.find((item) => item.id === batch.parcelId)
@@ -67,15 +79,15 @@ const filtered = computed(() => {
 
 const totals = computed(() => {
   const totalCapacity = tanks.value.reduce((sum, tank) => sum + tank.capacityL, 0)
-  const usedCapacity = tanks.value
-    .filter((tank) => occupancyOf(tank.id) !== null)
-    .reduce((sum, tank) => sum + tank.capacityL, 0)
+  // 罐位占用按批次入罐量实时重算，而不是按罐容量累加
+  const usedCapacity = tanks.value.reduce((sum, tank) => sum + occupiedVolumeOf(tank.id), 0)
   return {
     tankCount: tanks.value.length,
     totalCapacity,
     usedCapacity,
-    usageRatio: totalCapacity > 0 ? Math.round((usedCapacity / totalCapacity) * 100) : 0,
-    freeCount: tanks.value.filter((tank) => tank.state === '空闲').length
+    usageRatio: totalCapacity > 0 ? Math.min(100, Math.round((usedCapacity / totalCapacity) * 100)) : 0,
+    freeCount: tanks.value.filter((tank) => tank.state === '空闲').length,
+    overloadedCount: tanks.value.filter((tank) => isOverloaded(tank)).length
   }
 })
 
@@ -111,14 +123,19 @@ function openEdit(tank: TankRow): void {
 async function submit(): Promise<void> {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
-  if (editingId.value) {
-    await store.updateTank(editingId.value, { ...form })
-    ElMessage.success('罐位配置已更新')
-  } else {
-    await store.createTank({ ...form })
-    ElMessage.success('发酵罐已建档')
+  try {
+    if (editingId.value) {
+      // 容量改动：底层立即按最新入罐量重算占用，装不下当场抛错拒绝
+      await store.updateTank(editingId.value, { ...form })
+      ElMessage.success('罐位配置已更新，罐位占用已重算')
+    } else {
+      await store.createTank({ ...form })
+      ElMessage.success('发酵罐已建档')
+    }
+    dialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
-  dialogVisible.value = false
 }
 
 async function remove(tank: TankRow): Promise<void> {
@@ -148,11 +165,15 @@ async function changeState(tank: TankRow, next: TankState): Promise<void> {
   }
 }
 
-/** 为该罐分配一个在罐批次（真实占用冲突校验） */
+/** 为该罐分配一个在罐批次（原子占用互斥 + 容量校验，两个窗口同时分配只有一个成功） */
 async function assignBatch(tank: TankRow): Promise<void> {
   const candidates = batches.value.filter((batch) => batch.state !== '已出罐' && batch.tankId !== tank.id)
   if (candidates.length === 0) {
     ElMessage.info('暂无待分配的在罐批次')
+    return
+  }
+  if (tank.state === '清洗中') {
+    ElMessage.warning(`罐 ${tank.code} 正在清洗中，暂不可分配`)
     return
   }
   try {
@@ -166,8 +187,7 @@ async function assignBatch(tank: TankRow): Promise<void> {
       ElMessage.error('批次 id 不存在，请重新选择')
       return
     }
-    await store.ensureAssignable(tank.id, picked.id)
-    await store.updateTank(tank.id, { state: '在用' })
+    // 单事务内完成占用互斥校验、容量校验、批次改绑与罐位置「在用」
     await updateBatch(picked.id, { tankId: tank.id })
     ElMessage.success('罐位已分配')
   } catch (error) {
@@ -177,6 +197,11 @@ async function assignBatch(tank: TankRow): Promise<void> {
 
 function onFilterChange(next: FilterModel): void {
   store.setFilters(next)
+}
+
+/** 超载罐整行标红 */
+function tankRowClass({ row }: { row: TankRow }): string {
+  return isOverloaded(row) ? 'tank-row-overload' : ''
 }
 
 onMounted(() => {
@@ -221,6 +246,16 @@ watch(
       @reset="store.resetFilters()"
     />
 
+    <el-alert
+      v-if="totals.overloadedCount > 0"
+      class="mb"
+      type="error"
+      show-icon
+      :closable="false"
+      :title="`${totals.overloadedCount} 个罐当前在罐量超过容量（罐容量被改小后已按最新入罐量重算）`"
+      description="请调大罐容量、减少入罐量或安排相关批次出罐；在罐量超载的罐不能再承接新排程。"
+    />
+
     <el-card shadow="never">
       <template #header>
         <div class="card-title">
@@ -237,10 +272,23 @@ watch(
         @create="openCreate"
       />
 
-      <el-table v-else :data="filtered" stripe border>
+      <el-table v-else :data="filtered" stripe border :row-class-name="tankRowClass">
         <el-table-column prop="code" label="罐号" width="110" />
         <el-table-column prop="material" label="材质" width="110" />
-        <el-table-column prop="capacityL" label="容量(L)" width="110" align="right" />
+        <el-table-column label="容量(L)" width="110" align="right">
+          <template #default="{ row }">{{ row.capacityL }}</template>
+        </el-table-column>
+        <el-table-column label="在罐量(L)" width="140" align="right">
+          <template #default="{ row }">
+            <el-tag v-if="isOverloaded(row)" type="danger" effect="dark" size="small">
+              {{ occupiedVolumeOf(row.id) }} / {{ row.capacityL }} 超载
+            </el-tag>
+            <span v-else-if="occupiedVolumeOf(row.id) > 0" class="occupied-ok">
+              {{ occupiedVolumeOf(row.id) }} / {{ row.capacityL }}
+            </span>
+            <span v-else class="muted">0 / {{ row.capacityL }}</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="tempControl" label="温控方式" width="110" />
         <el-table-column label="罐位状态" width="130">
           <template #default="{ row }">
@@ -249,7 +297,10 @@ watch(
         </el-table-column>
         <el-table-column label="占用批次" min-width="200">
           <template #default="{ row }">
-            <span v-if="occupancyOf(row.id)">{{ batchLabel(occupancyOf(row.id)) }}</span>
+            <span v-if="occupancyOf(row.id)">
+              {{ batchLabel(occupancyOf(row.id)) }}
+              <el-tag v-if="isOverloaded(row)" type="danger" size="small" effect="plain" class="over-tag">容量不足</el-tag>
+            </span>
             <span v-else class="muted">未占用</span>
           </template>
         </el-table-column>
@@ -285,6 +336,12 @@ watch(
         </el-form-item>
         <el-form-item label="容量(L)" prop="capacityL">
           <el-input-number v-model="form.capacityL" :min="50" :max="50000" :step="50" />
+          <span v-if="editingId && occupiedVolumeOf(editingId) > 0" class="capacity-hint">
+            当前在罐量 {{ occupiedVolumeOf(editingId) }}L
+            <span v-if="form.capacityL < occupiedVolumeOf(editingId)" class="capacity-warn">
+              ，改小后将装不下、保存会被拒绝
+            </span>
+          </span>
         </el-form-item>
         <el-form-item label="温控方式">
           <el-select v-model="form.tempControl" class="full">
@@ -308,5 +365,28 @@ watch(
 <style scoped>
 .full {
   width: 100%;
+}
+
+.mb {
+  margin-bottom: 12px;
+}
+
+.capacity-hint {
+  margin-left: 12px;
+  font-size: 12px;
+  color: #8c8479;
+}
+
+.capacity-warn,
+.over-tag {
+  color: #c45656;
+}
+
+.occupied-ok {
+  font-variant-numeric: tabular-nums;
+}
+
+:deep(.tank-row-overload) {
+  background-color: #fef0f0;
 }
 </style>

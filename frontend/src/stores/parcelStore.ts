@@ -40,7 +40,7 @@ export const useParcelStore = defineStore('parcel', () => {
   async function createParcel(payload: Omit<Parcel, 'id'>): Promise<string> {
     const now = Date.now()
     const id = createId('parcel')
-    await putParcel({ ...payload, id, revision: ROW_REVISION, createdAt: now, updatedAt: now })
+    await putParcel({ ...payload, id, revision: ROW_REVISION, createdAt: now, updatedAt: now, reviewStatus: '正常' })
     selectedId.value = id
     return id
   }

@@ -7,7 +7,7 @@ import type { LocationQuery } from 'vue-router'
 import type { Tank, TankState } from '@/types/tank'
 import type { FilterModel } from '@/types/filter'
 import type { BatchRow, TankRow } from '@/utils/db'
-import { assertTankAssignable, putTank, removeTank, updateTank as updateTankRow, ROW_REVISION } from '@/utils/db'
+import { putTank, removeTank, updateTank as updateTankRow, ROW_REVISION } from '@/utils/db'
 import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
@@ -39,24 +39,15 @@ export const useTankStore = defineStore('tank', () => {
     return batches.find((batch) => batch.tankId === tankId && batch.state !== '已出罐') ?? null
   }
 
-  /** 分配前校验：罐位空闲且未被其它在罐批次占用 */
-  async function ensureAssignable(tankId: string, batchId: string | null): Promise<void> {
-    busy.value = true
-    try {
-      await assertTankAssignable(tankId, batchId)
-    } finally {
-      busy.value = false
-    }
-  }
-
   async function createTank(payload: Omit<Tank, 'id'>): Promise<string> {
     const now = Date.now()
     const id = createId('tank')
-    await putTank({ ...payload, id, revision: ROW_REVISION, createdAt: now, updatedAt: now })
+    await putTank({ ...payload, id, revision: ROW_REVISION, createdAt: now, updatedAt: now, reviewStatus: '正常' })
     selectedId.value = id
     return id
   }
 
+  /** 修改罐（含容量）：底层立即重算占用，容量装不下当前在罐量时拒绝 */
   async function updateTank(id: string, patch: Partial<Tank>): Promise<void> {
     await updateTankRow(id, patch)
   }
@@ -83,7 +74,6 @@ export const useTankStore = defineStore('tank', () => {
     applyQuery,
     select,
     occupancyOf,
-    ensureAssignable,
     createTank,
     updateTank,
     deleteTank,

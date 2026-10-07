@@ -53,7 +53,8 @@ export const useMlfStore = defineStore('mlf', () => {
         state: '进行中',
         revision: ROW_REVISION,
         createdAt: now,
-        updatedAt: now
+        updatedAt: now,
+        reviewStatus: '正常'
       })
     }
     await updateBatch(batchId, { state: '苹乳发酵' })

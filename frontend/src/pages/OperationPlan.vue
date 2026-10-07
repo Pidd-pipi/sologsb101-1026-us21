@@ -7,7 +7,7 @@ import { Plus, Rank } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
-import { db, type BatchRow, type OperationRow, type ParcelRow } from '@/utils/db'
+import { db, RevisionConflictError, type BatchRow, type OperationRow, type ParcelRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useOperationStore } from '@/stores/operationStore'
 import { OPERATION_STATES, OPERATION_TYPES, createEmptyOperation, type Operation } from '@/types/operation'
@@ -90,6 +90,8 @@ async function moveBy(index: number, offset: number): Promise<void> {
 /* ------------------------------ 新增 / 编辑 ------------------------------ */
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
+/** 打开编辑窗口时记录的修订号，保存前比对一次 */
+const editingRevision = ref(0)
 const formRef = ref<FormInstance>()
 const form = reactive<Omit<Operation, 'id' | 'seq'>>(createEmptyOperation())
 
@@ -100,6 +102,7 @@ const rules: FormRules = {
 
 function openCreate(): void {
   editingId.value = null
+  editingRevision.value = 0
   Object.assign(form, createEmptyOperation())
   if (store.currentBatchId) form.batchId = store.currentBatchId
   dialogVisible.value = true
@@ -107,6 +110,8 @@ function openCreate(): void {
 
 function openEdit(row: OperationRow): void {
   editingId.value = row.id
+  // 记下打开时的修订号；「待复核」历史行修订号为 0，保存时会按冲突处理，引导先复核
+  editingRevision.value = row.revision
   Object.assign(form, {
     batchId: row.batchId,
     type: row.type,
@@ -123,7 +128,7 @@ async function submit(): Promise<void> {
   if (!valid) return
   try {
     if (editingId.value) {
-      await store.updateOperation(editingId.value, { ...form })
+      await store.updateOperation(editingId.value, { ...form }, editingRevision.value)
       ElMessage.success('作业已更新')
     } else {
       await store.createOperation({ ...form })
@@ -131,6 +136,15 @@ async function submit(): Promise<void> {
     }
     dialogVisible.value = false
   } catch (error) {
+    if (error instanceof RevisionConflictError) {
+      // 落后一方：不关闭弹窗，表单里没提交的内容原样留住
+      ElMessageBox.alert(
+        `${error.message}。您编辑的内容仍保留在窗口里，请刷新查看对方改了什么后，再决定按新数据重填或重新保存。`,
+        '作业已被他人修改',
+        { type: 'warning', confirmButtonText: '我知道了' }
+      )
+      return
+    }
     ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
 }
@@ -271,6 +285,7 @@ watch(
           </el-select>
         </el-form-item>
       </el-form>
+      <div v-if="editingId" class="rev-hint">打开时修订号 #{{ editingRevision }}，保存时会先比对</div>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" @click="submit">保存</el-button>
@@ -347,5 +362,11 @@ watch(
 .op-item__actions {
   display: flex;
   align-items: center;
+}
+
+.rev-hint {
+  margin-top: -8px;
+  font-size: 12px;
+  color: #8c8479;
 }
 </style>

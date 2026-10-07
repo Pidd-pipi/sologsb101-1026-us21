@@ -139,7 +139,8 @@ async function createPlaceholder(batchId: string): Promise<void> {
     state: '未启动',
     revision: 1,
     createdAt: now,
-    updatedAt: now
+    updatedAt: now,
+    reviewStatus: '正常'
   })
   ElMessage.success('已建立苹乳跟踪记录')
 }

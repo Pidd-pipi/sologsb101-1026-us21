@@ -6,17 +6,12 @@ import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
 import type { Batch } from '@/types/batch'
 import type { FilterModel } from '@/types/filter'
-import type { BatchRow } from '@/utils/db'
 import {
-  assertTankAssignable,
-  putBatch,
+  createBatchAssigned,
   removeBatch,
   shipBatch as shipBatchRow,
-  updateBatch as updateBatchRow,
-  updateTank,
-  ROW_REVISION
+  updateBatch as updateBatchRow
 } from '@/utils/db'
-import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
 export const BATCH_FILTER_KEYS = ['states', 'parcelIds']
@@ -46,28 +41,25 @@ export const useBatchStore = defineStore('batch', () => {
     currentBatchId.value = id
   }
 
-  /** 入罐登记：先校验罐位可分配，再把罐置为「在用」 */
+  /**
+   * 入罐登记：占用互斥 + 容量校验 + 罐位置「在用」在底层同一事务内完成，
+   * 两个窗口同时把不同批次排进同一个罐时，只有一个能成功。
+   */
   async function createBatch(payload: Omit<Batch, 'id' | 'lastOperationAt'>): Promise<string> {
     error.value = null
     if (!payload.parcelId) throw new Error('请选择地块')
     if (!payload.tankId) throw new Error('请选择发酵罐')
-    await assertTankAssignable(payload.tankId, null)
-    const now = Date.now()
-    const id = createId('batch')
-    await putBatch({ ...payload, id, lastOperationAt: null, revision: ROW_REVISION, createdAt: now, updatedAt: now })
-    await updateTank(payload.tankId, { state: '在用' })
-    currentBatchId.value = id
-    return id
+    const row = await createBatchAssigned(payload)
+    currentBatchId.value = row.id
+    return row.id
   }
 
-  /** 改绑罐位：校验新罐可用后再释放旧罐 */
-  async function updateBatch(id: string, patch: Partial<Batch>, current: BatchRow): Promise<void> {
+  /**
+   * 改批次（入罐量 / 罐位等）：底层按最新罐容量与占用重算，
+   * 目标罐装不下时当场拒绝；改绑罐位是原子互斥的。
+   */
+  async function updateBatch(id: string, patch: Partial<Batch>): Promise<void> {
     error.value = null
-    if (patch.tankId && patch.tankId !== current.tankId) {
-      await assertTankAssignable(patch.tankId, id)
-      await updateTank(patch.tankId, { state: '在用' })
-      if (current.tankId) await updateTank(current.tankId, { state: '空闲' })
-    }
     await updateBatchRow(id, patch)
   }
 

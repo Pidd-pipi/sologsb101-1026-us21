@@ -12,11 +12,15 @@ import {
   countAll,
   exportSnapshot,
   importSnapshot,
+  listPendingReview,
+  resolvePendingReview,
   resetDatabase,
+  updateTasting,
   DB_NAME,
   DB_SCHEMA_VERSION,
   type BatchRow,
   type ParcelRow,
+  type PendingReviewItem,
   type TastingRow
 } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
@@ -124,7 +128,7 @@ async function submit(): Promise<void> {
   if (!valid) return
   const now = Date.now()
   if (editingId.value) {
-    await db.tastings.update(editingId.value, { ...form, updatedAt: now } as never)
+    await updateTasting(editingId.value, { ...form })
     ElMessage.success('品评记录已更新')
   } else {
     await db.tastings.put({
@@ -132,11 +136,13 @@ async function submit(): Promise<void> {
       id: `tasting-${now.toString(36)}`,
       revision: ROW_REVISION,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      reviewStatus: '正常'
     })
     ElMessage.success('品评记录已保存')
   }
   dialogVisible.value = false
+  void refreshPending()
 }
 
 async function remove(row: TastingRow): Promise<void> {
@@ -175,9 +181,31 @@ async function exportArchive(): Promise<void> {
 
 /* --------------------------- 整库版本与导入导出 --------------------------- */
 const dbCounts = ref<Record<string, number>>({})
+/** 升级时修订号按创建时间回填不了、需要人工复核的旧数据 */
+const pendingReview = ref<PendingReviewItem[]>([])
+
+const TABLE_LABELS: Record<string, string> = {
+  parcels: '地块',
+  tanks: '发酵罐',
+  batches: '入罐批次',
+  readings: '发酵读数',
+  operations: '作业',
+  mlfs: '苹乳发酵',
+  tastings: '品评'
+}
 
 async function refreshCounts(): Promise<void> {
   dbCounts.value = await countAll()
+}
+
+async function refreshPending(): Promise<void> {
+  pendingReview.value = await listPendingReview()
+}
+
+async function resolveReview(item: PendingReviewItem): Promise<void> {
+  await resolvePendingReview(item.table, item.id)
+  await refreshPending()
+  ElMessage.success(`已复核：${TABLE_LABELS[item.table] ?? item.table} ${item.id}`)
 }
 
 async function exportLibrary(): Promise<void> {
@@ -198,6 +226,7 @@ async function importLibrary(): Promise<void> {
     }
     await importSnapshot(parsed as unknown as Awaited<ReturnType<typeof exportSnapshot>>)
     await refreshCounts()
+    await refreshPending()
     ElMessage.success('备份已导入')
   } catch (error) {
     if (error instanceof Error && error.message) ElMessage.error(`导入失败：${error.message}`)
@@ -212,6 +241,7 @@ async function resetDemo(): Promise<void> {
   }
   await resetDatabase()
   await refreshCounts()
+  await refreshPending()
   ElMessage.success('已重置为演示数据')
 }
 
@@ -221,6 +251,7 @@ function onFilterChange(next: FilterModel): void {
 
 onMounted(async () => {
   await refreshCounts()
+  await refreshPending()
   if (typeof route.query.verdicts === 'string') {
     filters.value.verdicts = route.query.verdicts.split(',')
   }
@@ -354,6 +385,42 @@ watch(
             <el-button :icon="Upload" @click="importLibrary">导入备份</el-button>
             <el-button type="danger" plain @click="resetDemo">重置演示数据</el-button>
           </div>
+
+          <el-divider content-position="left">旧数据升级复核</el-divider>
+          <el-alert
+            v-if="pendingReview.length === 0"
+            type="success"
+            :closable="false"
+            show-icon
+            title="没有待复核数据"
+            description="旧数据的修订号已在升级时按创建时间全部回填完成。"
+          />
+          <template v-else>
+            <el-alert
+              type="warning"
+              :closable="false"
+              show-icon
+              class="mb"
+              :title="`${pendingReview.length} 条旧数据缺少可用的创建时间，修订号无法按创建时间回填，已标为待复核`"
+              description="请人工核对这些记录；复核通过后修订号恢复为 #1，或直接在对应页面打开编辑再保存。"
+            />
+            <el-table :data="pendingReview" size="small" border max-height="240">
+              <el-table-column label="数据表" width="110">
+                <template #default="{ row }">{{ TABLE_LABELS[row.table] ?? row.table }}</template>
+              </el-table-column>
+              <el-table-column prop="id" label="记录 id" min-width="180" />
+              <el-table-column label="修订号" width="90" align="center">
+                <template #default="{ row }">
+                  <el-tag type="warning" size="small">#{{ row.revision }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" width="100" align="center">
+                <template #default="{ row }">
+                  <el-button link type="primary" size="small" @click="resolveReview(row)">复核通过</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </template>
         </el-card>
       </el-col>
     </el-row>

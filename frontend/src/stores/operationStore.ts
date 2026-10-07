@@ -1,5 +1,7 @@
 /**
  * 作业 store：维护作业顺序、完成态与作业类型筛选。
+ * - 新增 / 改批次前过容量闸门：目标罐装不下当前入罐量时当场拒绝排程
+ * - 编辑保存带修订号乐观锁：窗口打开时记下 revision，落后一方保存被拒
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
@@ -7,12 +9,13 @@ import type { LocationQuery } from 'vue-router'
 import type { Operation } from '@/types/operation'
 import type { FilterModel } from '@/types/filter'
 import {
+  assertBatchFitsTank,
   completeOperation,
   nextOperationSeq,
   putOperation,
   removeOperation,
   reorderOperations,
-  updateOperation as updateOperationRow,
+  saveOperation,
   ROW_REVISION
 } from '@/utils/db'
 import { createId } from '@/utils/uuid'
@@ -43,18 +46,30 @@ export const useOperationStore = defineStore('operation', () => {
     currentBatchId.value = id
   }
 
+  /** 新增作业：排程前校验目标罐容量装得下该批次的当前入罐量 */
   async function createOperation(payload: Omit<Operation, 'id' | 'seq'>): Promise<string> {
     if (!payload.batchId) throw new Error('请选择批次')
     if (!payload.operator.trim()) throw new Error('请填写操作人')
+    await assertBatchFitsTank(payload.batchId)
     const seq = await nextOperationSeq(payload.batchId)
     const now = Date.now()
     const id = createId('operation')
-    await putOperation({ ...payload, id, seq, revision: ROW_REVISION, createdAt: now, updatedAt: now })
+    await putOperation({ ...payload, id, seq, revision: ROW_REVISION, createdAt: now, updatedAt: now, reviewStatus: '正常' })
     return id
   }
 
-  async function updateOperation(id: string, patch: Partial<Operation>): Promise<void> {
-    await updateOperationRow(id, patch)
+  /**
+   * 编辑作业（乐观锁）：expectedRevision 为打开编辑窗口时记下的修订号。
+   * 改了批次则重新过容量闸门；修订号落后时抛 RevisionConflictError，内容留在表单。
+   */
+  async function updateOperation(
+    id: string,
+    patch: Partial<Operation>,
+    expectedRevision: number
+  ): Promise<void> {
+    const batchId = patch.batchId
+    if (batchId) await assertBatchFitsTank(batchId)
+    await saveOperation(id, patch, expectedRevision)
   }
 
   async function deleteOperation(id: string): Promise<void> {

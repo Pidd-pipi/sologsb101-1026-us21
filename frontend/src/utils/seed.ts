@@ -6,24 +6,24 @@
 import type { ParcelRow, TankRow, BatchRow, ReadingRow, OperationRow, MlfRow, TastingRow } from './db'
 import { db, ROW_REVISION } from './db'
 
-function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
-  return { ...row, revision: ROW_REVISION, createdAt: Date.now(), updatedAt: Date.now() }
+function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number; reviewStatus: '正常' } {
+  return { ...row, revision: ROW_REVISION, createdAt: Date.now(), updatedAt: Date.now(), reviewStatus: '正常' }
 }
 
-const PARCELS: Array<Omit<ParcelRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const PARCELS: Array<Omit<ParcelRow, 'revision' | 'createdAt' | 'updatedAt' | 'reviewStatus'>> = [
   { id: 'p-001', name: '东坡三号地', variety: '赤霞珠', areaMu: 12.5, vineAge: 8, aspect: '南' },
   { id: 'p-002', name: '南坡老藤地', variety: '梅洛', areaMu: 8, vineAge: 15, aspect: '东南' },
   { id: 'p-003', name: '西坡白葡萄地', variety: '霞多丽', areaMu: 5.5, vineAge: 6, aspect: '西' }
 ]
 
-const TANKS: Array<Omit<TankRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const TANKS: Array<Omit<TankRow, 'revision' | 'createdAt' | 'updatedAt' | 'reviewStatus'>> = [
   { id: 'tk-001', code: 'F-01', material: '不锈钢', capacityL: 3000, tempControl: '夹套', state: '在用' },
   { id: 'tk-002', code: 'F-02', material: '橡木', capacityL: 2250, tempControl: '无', state: '在用' },
   { id: 'tk-003', code: 'F-03', material: '不锈钢', capacityL: 1500, tempControl: '盘管', state: '空闲' },
   { id: 'tk-004', code: 'F-04', material: '混凝土', capacityL: 5000, tempControl: '夹套', state: '清洗中' }
 ]
 
-const BATCHES: Array<Omit<BatchRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const BATCHES: Array<Omit<BatchRow, 'revision' | 'createdAt' | 'updatedAt' | 'reviewStatus'>> = [
   {
     id: 'b-001',
     parcelId: 'p-001',
@@ -56,7 +56,7 @@ const BATCHES: Array<Omit<BatchRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
   }
 ]
 
-const READINGS: Array<Omit<ReadingRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const READINGS: Array<Omit<ReadingRow, 'revision' | 'createdAt' | 'updatedAt' | 'reviewStatus'>> = [
   { id: 'r-001', batchId: 'b-001', date: '2024-09-12', gravity: 1.102, tempC: 24.5, brix: 24.5 },
   { id: 'r-002', batchId: 'b-001', date: '2024-09-14', gravity: 1.078, tempC: 27.2, brix: 19.4 },
   { id: 'r-003', batchId: 'b-001', date: '2024-09-16', gravity: 1.052, tempC: 31.4, brix: 13.1 },
@@ -70,7 +70,7 @@ const READINGS: Array<Omit<ReadingRow, 'revision' | 'createdAt' | 'updatedAt'>> 
   { id: 'r-011', batchId: 'b-003', date: '2024-10-05', gravity: 0.994, tempC: 16.5, brix: -1.5 }
 ]
 
-const OPERATIONS: Array<Omit<OperationRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const OPERATIONS: Array<Omit<OperationRow, 'revision' | 'createdAt' | 'updatedAt' | 'reviewStatus'>> = [
   { id: 'op-001', batchId: 'b-001', type: '压帽', date: '2024-09-13', durationMin: 30, operator: '陈岩', state: '已完成', seq: 1 },
   { id: 'op-002', batchId: 'b-001', type: '淋皮', date: '2024-09-14', durationMin: 25, operator: '陈岩', state: '已完成', seq: 2 },
   { id: 'op-003', batchId: 'b-001', type: '倒罐', date: '2024-09-18', durationMin: 55, operator: '林沐', state: '已完成', seq: 3 },
@@ -81,13 +81,13 @@ const OPERATIONS: Array<Omit<OperationRow, 'revision' | 'createdAt' | 'updatedAt
   { id: 'op-008', batchId: 'b-003', type: '倒罐', date: '2024-09-28', durationMin: 45, operator: '许澜', state: '已完成', seq: 1 }
 ]
 
-const MLFS: Array<Omit<MlfRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const MLFS: Array<Omit<MlfRow, 'revision' | 'createdAt' | 'updatedAt' | 'reviewStatus'>> = [
   { id: 'mlf-001', batchId: 'b-001', startDate: '', endDate: '', malicG: 2.4, state: '未启动' },
   { id: 'mlf-002', batchId: 'b-002', startDate: '2024-09-26', endDate: '', malicG: 0.9, state: '进行中' },
   { id: 'mlf-003', batchId: 'b-003', startDate: '2024-09-29', endDate: '2024-10-06', malicG: 0.2, state: '已完成' }
 ]
 
-const TASTINGS: Array<Omit<TastingRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const TASTINGS: Array<Omit<TastingRow, 'revision' | 'createdAt' | 'updatedAt' | 'reviewStatus'>> = [
   {
     id: 'ts-001',
     batchId: 'b-001',
