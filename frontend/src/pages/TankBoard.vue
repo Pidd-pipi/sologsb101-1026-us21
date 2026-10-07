@@ -8,7 +8,7 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
-import { db, updateBatch, type BatchRow, type ParcelRow, type TankRow } from '@/utils/db'
+import { db, RevisionConflictError, type BatchRow, type ParcelRow, type TankDraft, type TankRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useTankStore } from '@/stores/tankStore'
 import {
@@ -16,10 +16,10 @@ import {
   TANK_STATES,
   TANK_TEMP_CONTROLS,
   createEmptyTank,
-  type Tank,
   type TankState
 } from '@/types/tank'
 import type { FilterSelectConfig, FilterModel } from '@/types/filter'
+import { REVIEW_PENDING } from '@/types/revision'
 import { filtersToQuery } from '@/utils/query'
 import { ROUTES } from '@/router'
 
@@ -82,22 +82,47 @@ const totals = computed(() => {
 /* ------------------------------ 新增 / 编辑 ------------------------------ */
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
+/** 打开罐编辑时记下的修订号，保存前比对一次 */
+const baseRevision = ref<number | undefined>(undefined)
+/** 已被其他窗口改动时留住表单内容 */
+const conflict = ref<RevisionConflictError | null>(null)
 const formRef = ref<FormInstance>()
-const form = reactive<Omit<Tank, 'id'>>(createEmptyTank())
+const form = reactive(createEmptyTank())
 
 const rules: FormRules = {
   code: [{ required: true, message: '请填写罐号', trigger: 'blur' }],
   capacityL: [{ required: true, message: '请填写容量', trigger: 'blur' }]
 }
 
+/** 编辑时该罐正在占用的在罐批次：容量改到小于其入罐量会被底层拒绝，这里先做界面提示 */
+const editingTank = computed<TankRow | null>(() =>
+  editingId.value ? tanks.value.find((item) => item.id === editingId.value) ?? null : null
+)
+const capacityBlocked = computed(() => {
+  if (!editingTank.value) return null
+  const overflow = batches.value.find(
+    (batch) => batch.tankId === editingTank.value?.id && batch.state !== '已出罐' && batch.volumeL > form.capacityL
+  )
+  return overflow ? overflow : null
+})
+
+function formatTime(ms: number): string {
+  return new Date(ms).toLocaleString('zh-CN', { hour12: false })
+}
+
 function openCreate(): void {
   editingId.value = null
+  baseRevision.value = undefined
+  conflict.value = null
   Object.assign(form, createEmptyTank())
   dialogVisible.value = true
 }
 
 function openEdit(tank: TankRow): void {
   editingId.value = tank.id
+  // 记打开时的修订号
+  baseRevision.value = tank.revision
+  conflict.value = null
   Object.assign(form, {
     code: tank.code,
     material: tank.material,
@@ -108,17 +133,41 @@ function openEdit(tank: TankRow): void {
   dialogVisible.value = true
 }
 
-async function submit(): Promise<void> {
+async function submit(force = false): Promise<void> {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
-  if (editingId.value) {
-    await store.updateTank(editingId.value, { ...form })
-    ElMessage.success('罐位配置已更新')
-  } else {
-    await store.createTank({ ...form })
-    ElMessage.success('发酵罐已建档')
+  try {
+    const draft: TankDraft = { ...form }
+    if (editingId.value && baseRevision.value !== undefined) {
+      await store.saveExistingTank(editingId.value, draft, baseRevision.value, force)
+    } else {
+      await store.createTank(draft)
+    }
+    ElMessage.success(editingId.value ? '罐位配置已更新，罐位占用已按新容量重算' : '发酵罐已建档')
+    conflict.value = null
+    dialogVisible.value = false
+  } catch (error) {
+    if (error instanceof RevisionConflictError) {
+      conflict.value = error
+    } else {
+      ElMessage.error(error instanceof Error ? error.message : '罐位保存失败')
+    }
   }
-  dialogVisible.value = false
+}
+
+/** 冲突后载入对方保存的最新罐配置 */
+function adoptLatest(): void {
+  const latest = conflict.value?.latest as TankRow | undefined
+  if (!latest) return
+  Object.assign(form, {
+    code: latest.code,
+    material: latest.material,
+    capacityL: latest.capacityL,
+    tempControl: latest.tempControl,
+    state: latest.state
+  })
+  baseRevision.value = conflict.value?.currentRevision
+  conflict.value = null
 }
 
 async function remove(tank: TankRow): Promise<void> {
@@ -166,10 +215,9 @@ async function assignBatch(tank: TankRow): Promise<void> {
       ElMessage.error('批次 id 不存在，请重新选择')
       return
     }
-    await store.ensureAssignable(tank.id, picked.id)
-    await store.updateTank(tank.id, { state: '在用' })
-    await updateBatch(picked.id, { tankId: tank.id })
-    ElMessage.success('罐位已分配')
+    // 占用冲突与容量校验全部在事务内：两个窗口同时分配同一罐时，后到者被当场拒绝
+    await store.assignBatchToTank(picked, tank.id)
+    ElMessage.success('罐位已分配，罐位占用已重算')
   } catch (error) {
     if (error instanceof Error && error.message) ElMessage.warning(error.message)
   }
@@ -238,7 +286,12 @@ watch(
       />
 
       <el-table v-else :data="filtered" stripe border>
-        <el-table-column prop="code" label="罐号" width="110" />
+        <el-table-column label="罐号" width="130">
+          <template #default="{ row }">
+            {{ row.code }}
+            <el-tag v-if="row.reviewState === REVIEW_PENDING" type="danger" size="small" effect="plain">待复核</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="material" label="材质" width="110" />
         <el-table-column prop="capacityL" label="容量(L)" width="110" align="right" />
         <el-table-column prop="tempControl" label="温控方式" width="110" />
@@ -274,6 +327,29 @@ watch(
     </el-card>
 
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑发酵罐' : '新增发酵罐'" width="520px">
+      <el-alert
+        v-if="conflict"
+        type="error"
+        :closable="false"
+        show-icon
+        class="mb"
+        title="这个罐的配置已经被其他人改过"
+        :description="`对方保存于 ${formatTime(conflict.latestUpdatedAt)}（最新修订号 ${conflict.currentRevision}）。你填写的内容仍保留在表单里，可载入最新内容后再改，或强制以你的内容覆盖。`"
+      >
+        <div class="conflict-actions">
+          <el-button size="small" type="primary" @click="adoptLatest">载入最新内容</el-button>
+          <el-button size="small" type="danger" plain @click="submit(true)">仍以我的内容覆盖</el-button>
+        </div>
+      </el-alert>
+      <el-alert
+        v-if="capacityBlocked"
+        type="error"
+        :closable="false"
+        show-icon
+        class="mb"
+        :title="`容量 ${form.capacityL}L 装不下在罐批次（入罐量 ${capacityBlocked.volumeL}L）`"
+        description="请先安排该批次出罐或调整入罐量，再把罐容量改小。"
+      />
       <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
         <el-form-item label="罐号" prop="code">
           <el-input v-model="form.code" placeholder="如：F-05" />
@@ -299,7 +375,7 @@ watch(
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submit">保存</el-button>
+        <el-button type="primary" :disabled="capacityBlocked !== null" @click="submit(false)">保存</el-button>
       </template>
     </el-dialog>
   </div>
@@ -308,5 +384,15 @@ watch(
 <style scoped>
 .full {
   width: 100%;
+}
+
+.mb {
+  margin-bottom: 12px;
+}
+
+.conflict-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
 }
 </style>

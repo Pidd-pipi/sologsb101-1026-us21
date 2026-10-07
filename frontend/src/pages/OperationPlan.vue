@@ -7,10 +7,11 @@ import { Plus, Rank } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
-import { db, type BatchRow, type OperationRow, type ParcelRow } from '@/utils/db'
+import { db, RevisionConflictError, type BatchRow, type OperationDraft, type OperationRow, type ParcelRow, type TankRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useOperationStore } from '@/stores/operationStore'
-import { OPERATION_STATES, OPERATION_TYPES, createEmptyOperation, type Operation } from '@/types/operation'
+import { OPERATION_STATES, OPERATION_TYPES, createEmptyOperation } from '@/types/operation'
+import { REVIEW_PENDING } from '@/types/revision'
 import type { FilterSelectConfig, FilterModel } from '@/types/filter'
 import { filtersToQuery } from '@/utils/query'
 
@@ -23,17 +24,30 @@ const { rows: operations, ready } = useIdbTable<OperationRow>(() => db.operation
 })
 const { rows: batches } = useIdbTable<BatchRow>(() => db.batches)
 const { rows: parcels } = useIdbTable<ParcelRow>(() => db.parcels)
+const { rows: tanks } = useIdbTable<TankRow>(() => db.tanks)
 
 const selects: FilterSelectConfig[] = [
   { key: 'types', label: '作业类型', options: OPERATION_TYPES.map((item) => ({ label: item, value: item })) },
   { key: 'states', label: '状态', options: OPERATION_STATES.map((item) => ({ label: item, value: item })) }
 ]
 
+function batchTank(batchId: string): TankRow | null {
+  const batch = batches.value.find((item) => item.id === batchId)
+  if (!batch || !batch.tankId) return null
+  return tanks.value.find((item) => item.id === batch.tankId) ?? null
+}
+
 function batchLabel(batchId: string): string {
   const batch = batches.value.find((item) => item.id === batchId)
   if (!batch) return '批次已删除'
   const parcel = parcels.value.find((item) => item.id === batch.parcelId)
-  return `${parcel ? parcel.name : '未知地块'} · ${batch.harvestDate}`
+  const tank = batchTank(batchId)
+  const tankText = tank ? ` · 罐 ${tank.code} ${batch.volumeL}/${tank.capacityL}L` : ''
+  return `${parcel ? parcel.name : '未知地块'} · ${batch.harvestDate}${tankText}`
+}
+
+function formatTime(ms: number): string {
+  return new Date(ms).toLocaleString('zh-CN', { hour12: false })
 }
 
 const filtered = computed(() => {
@@ -90,8 +104,26 @@ async function moveBy(index: number, offset: number): Promise<void> {
 /* ------------------------------ 新增 / 编辑 ------------------------------ */
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
+/** 打开编辑窗口时记下的修订号，保存前比对一次 */
+const baseRevision = ref<number | undefined>(undefined)
+/** 保存发现已被其他窗口改过：留住表单，等用户选择载入最新或强制覆盖 */
+const conflict = ref<RevisionConflictError | null>(null)
 const formRef = ref<FormInstance>()
-const form = reactive<Omit<Operation, 'id' | 'seq'>>(createEmptyOperation())
+const form = reactive(createEmptyOperation())
+
+/** 当前所选批次的目标罐容量信息：容量装不下入罐量时直接在表单上拒绝排程 */
+const selectedBatch = computed<BatchRow | null>(
+  () => batches.value.find((item) => item.id === form.batchId) ?? null
+)
+const selectedTank = computed<TankRow | null>(() => {
+  const batch = selectedBatch.value
+  return batch && batch.tankId ? tanks.value.find((item) => item.id === batch.tankId) ?? null : null
+})
+const capacityShortage = computed(() => {
+  const batch = selectedBatch.value
+  const tank = selectedTank.value
+  return Boolean(batch && tank && batch.volumeL > tank.capacityL)
+})
 
 const rules: FormRules = {
   batchId: [{ required: true, message: '请选择批次', trigger: 'change' }],
@@ -100,6 +132,8 @@ const rules: FormRules = {
 
 function openCreate(): void {
   editingId.value = null
+  baseRevision.value = undefined
+  conflict.value = null
   Object.assign(form, createEmptyOperation())
   if (store.currentBatchId) form.batchId = store.currentBatchId
   dialogVisible.value = true
@@ -107,6 +141,9 @@ function openCreate(): void {
 
 function openEdit(row: OperationRow): void {
   editingId.value = row.id
+  // 记打开时的修订号
+  baseRevision.value = row.revision
+  conflict.value = null
   Object.assign(form, {
     batchId: row.batchId,
     type: row.type,
@@ -118,21 +155,49 @@ function openEdit(row: OperationRow): void {
   dialogVisible.value = true
 }
 
-async function submit(): Promise<void> {
+async function submit(force = false): Promise<void> {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
+  if (capacityShortage.value) {
+    ElMessage.error(
+      `目标罐 ${selectedTank.value?.code} 容量 ${selectedTank.value?.capacityL}L，装不下该批次入罐量 ${selectedBatch.value?.volumeL}L，请先调整罐容量或入罐量`
+    )
+    return
+  }
   try {
-    if (editingId.value) {
-      await store.updateOperation(editingId.value, { ...form })
-      ElMessage.success('作业已更新')
+    const draft: OperationDraft = { ...form }
+    if (editingId.value && baseRevision.value !== undefined) {
+      await store.saveExistingOperation(editingId.value, draft, baseRevision.value, force)
     } else {
-      await store.createOperation({ ...form })
-      ElMessage.success('作业已排入队列')
+      await store.createOperation(draft)
     }
+    ElMessage.success(editingId.value ? '作业已更新' : '作业已排入队列')
+    conflict.value = null
     dialogVisible.value = false
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '保存失败')
+    if (error instanceof RevisionConflictError) {
+      // 不关弹窗、不清表单：未提交的内容留住
+      conflict.value = error
+    } else {
+      ElMessage.error(error instanceof Error ? error.message : '保存失败')
+    }
   }
+}
+
+/** 冲突后载入对方保存的最新作业内容 */
+function adoptLatest(): void {
+  const latest = conflict.value?.latest as OperationRow | undefined
+  if (!latest) return
+  Object.assign(form, {
+    batchId: latest.batchId,
+    type: latest.type,
+    date: latest.date,
+    durationMin: latest.durationMin,
+    operator: latest.operator,
+    state: latest.state
+  })
+  baseRevision.value = conflict.value?.currentRevision
+  conflict.value = null
 }
 
 async function finish(row: OperationRow): Promise<void> {
@@ -224,6 +289,7 @@ watch(
             <strong>{{ row.type }}</strong>
             <StageTag :value="row.state" size="small" />
             <el-tag size="small" effect="plain">{{ row.durationMin }} 分钟</el-tag>
+            <el-tag v-if="row.reviewState === REVIEW_PENDING" type="danger" size="small" effect="plain">待复核</el-tag>
           </div>
           <div class="op-item__meta">
             {{ row.date }} · 操作人 {{ row.operator }} · {{ batchLabel(row.batchId) }}
@@ -240,6 +306,29 @@ watch(
     </div>
 
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑作业' : '新增作业'" width="540px">
+      <el-alert
+        v-if="conflict"
+        type="error"
+        :closable="false"
+        show-icon
+        class="full mb"
+        title="这条作业已经被其他人改过"
+        :description="`对方保存于 ${formatTime(conflict.latestUpdatedAt)}（最新修订号 ${conflict.currentRevision}）。你填写的排程仍保留在表单里，可载入最新内容后再改，或强制以你的内容覆盖。`"
+      >
+        <div class="conflict-actions">
+          <el-button size="small" type="primary" @click="adoptLatest">载入最新内容</el-button>
+          <el-button size="small" type="danger" plain @click="submit(true)">仍以我的内容覆盖</el-button>
+        </div>
+      </el-alert>
+      <el-alert
+        v-if="capacityShortage"
+        type="error"
+        :closable="false"
+        show-icon
+        class="full mb"
+        :title="`目标罐容量不足：入罐量 ${selectedBatch?.volumeL}L ＞ 罐容 ${selectedTank?.capacityL}L`"
+        description="罐容量或批次入罐量已被改动。请先在罐配置 / 入罐登记里调整，当前不能把这条作业排进去。"
+      />
       <el-form ref="formRef" :model="form" :rules="rules" label-width="100px">
         <el-form-item label="批次" prop="batchId">
           <el-select v-model="form.batchId" class="full" placeholder="选择批次">
@@ -294,6 +383,12 @@ watch(
 .batch-filter {
   width: 240px;
   margin-left: auto;
+}
+
+.conflict-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
 }
 
 .op-list {

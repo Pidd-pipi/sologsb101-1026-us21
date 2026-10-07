@@ -5,9 +5,16 @@
 import { liveQuery } from 'dexie'
 import { onScopeDispose, ref, shallowRef, type Ref } from 'vue'
 import { db, ROW_REVISION } from '@/utils/db'
+import { REVIEW_NORMAL } from '@/types/revision'
 import { createId } from '@/utils/uuid'
 
-export type IdbRecord = { id: string; createdAt?: number; updatedAt?: number }
+export type IdbRecord = {
+  id: string
+  revision?: number
+  reviewState?: import('@/types/revision').ReviewState
+  createdAt?: number
+  updatedAt?: number
+}
 
 export interface UseIdbTableOptions<T extends IdbRecord> {
   /** 结果排序器，默认按 updatedAt 倒序 */
@@ -75,6 +82,7 @@ export function useIdbTable<T extends IdbRecord>(
       ...(payload as object),
       id: payload.id ?? createId(idPrefix),
       revision: ROW_REVISION,
+      reviewState: REVIEW_NORMAL,
       createdAt: now,
       updatedAt: now
     } as unknown as T
@@ -83,11 +91,28 @@ export function useIdbTable<T extends IdbRecord>(
   }
 
   const update = async (id: string, patch: Partial<T>): Promise<void> => {
-    await table.update(id, { ...patch, updatedAt: Date.now() } as never)
+    // 修订号 +1：与 db.ts 的乐观锁写保持同一语义，避免旧窗口用 useIdbTable 覆盖新内容
+    const current = await table.get(id)
+    if (!current) throw new Error('记录不存在或已被删除')
+    const baseRevision = typeof current.revision === 'number' ? current.revision : ROW_REVISION
+    const next: Record<string, unknown> = {
+      ...(patch as object),
+      revision: baseRevision + 1,
+      reviewState: REVIEW_NORMAL,
+      updatedAt: Date.now()
+    }
+    await table.update(id, next as never)
   }
 
   const upsert = async (row: T): Promise<void> => {
-    await table.put({ ...row, updatedAt: Date.now() } as T)
+    const current = await table.get(row.id)
+    const previousRevision = current?.revision ?? row.revision ?? ROW_REVISION
+    await table.put({
+      ...row,
+      revision: previousRevision + 1,
+      reviewState: REVIEW_NORMAL,
+      updatedAt: Date.now()
+    } as T)
   }
 
   if (options.immediate !== false) {

@@ -12,19 +12,22 @@ import {
   countAll,
   exportSnapshot,
   importSnapshot,
+  putTasting,
   resetDatabase,
+  updateTasting,
   DB_NAME,
   DB_SCHEMA_VERSION,
+  ROW_REVISION,
   type BatchRow,
   type ParcelRow,
   type TastingRow
 } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { TASTING_VERDICTS, createEmptyTasting, type Tasting } from '@/types/tasting'
+import { REVIEW_NORMAL } from '@/types/revision'
 import type { FilterSelectConfig, FilterModel } from '@/types/filter'
 import { buildBatchArchive, downloadJson, parseArchive, serializeArchive } from '@/utils/export'
 import { filtersToQuery } from '@/utils/query'
-import { ROW_REVISION } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
@@ -124,13 +127,14 @@ async function submit(): Promise<void> {
   if (!valid) return
   const now = Date.now()
   if (editingId.value) {
-    await db.tastings.update(editingId.value, { ...form, updatedAt: now } as never)
+    await updateTasting(editingId.value, { ...form })
     ElMessage.success('品评记录已更新')
   } else {
-    await db.tastings.put({
+    await putTasting({
       ...form,
       id: `tasting-${now.toString(36)}`,
       revision: ROW_REVISION,
+      reviewState: REVIEW_NORMAL,
       createdAt: now,
       updatedAt: now
     })
@@ -348,6 +352,11 @@ watch(
             <el-descriptions-item label="批次/读数">{{ dbCounts.batches ?? 0 }} / {{ dbCounts.readings ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="作业/苹乳">{{ dbCounts.operations ?? 0 }} / {{ dbCounts.mlfs ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="品评">{{ dbCounts.tastings ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="待复核旧数据">
+              <el-tag :type="dbCounts.pendingReview ? 'danger' : 'success'" size="small">
+                {{ dbCounts.pendingReview ?? 0 }} 条
+              </el-tag>
+            </el-descriptions-item>
           </el-descriptions>
           <div class="btn-row">
             <el-button :icon="Download" @click="exportLibrary">导出整库 JSON</el-button>

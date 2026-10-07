@@ -1,22 +1,18 @@
 /**
  * 入罐批次 store：维护在罐批次、当前选中批次与地块/罐绑定校验。
+ * 保存统一走 db.saveBatch：事务内做乐观锁比对、目标罐唯一占用与容量校验。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
 import type { Batch } from '@/types/batch'
 import type { FilterModel } from '@/types/filter'
-import type { BatchRow } from '@/utils/db'
 import {
-  assertTankAssignable,
-  putBatch,
   removeBatch,
+  saveBatch as saveBatchRow,
   shipBatch as shipBatchRow,
-  updateBatch as updateBatchRow,
-  updateTank,
-  ROW_REVISION
+  type BatchDraft
 } from '@/utils/db'
-import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
 export const BATCH_FILTER_KEYS = ['states', 'parcelIds']
@@ -46,29 +42,27 @@ export const useBatchStore = defineStore('batch', () => {
     currentBatchId.value = id
   }
 
-  /** 入罐登记：先校验罐位可分配，再把罐置为「在用」 */
+  /** 入罐登记：事务内校验罐位未被占用且容量足够，随后罐位自动置为「在用」 */
   async function createBatch(payload: Omit<Batch, 'id' | 'lastOperationAt'>): Promise<string> {
     error.value = null
-    if (!payload.parcelId) throw new Error('请选择地块')
-    if (!payload.tankId) throw new Error('请选择发酵罐')
-    await assertTankAssignable(payload.tankId, null)
-    const now = Date.now()
-    const id = createId('batch')
-    await putBatch({ ...payload, id, lastOperationAt: null, revision: ROW_REVISION, createdAt: now, updatedAt: now })
-    await updateTank(payload.tankId, { state: '在用' })
+    const id = await saveBatchRow(payload, null, undefined)
     currentBatchId.value = id
     return id
   }
 
-  /** 改绑罐位：校验新罐可用后再释放旧罐 */
-  async function updateBatch(id: string, patch: Partial<Batch>, current: BatchRow): Promise<void> {
+  /**
+   * 保存对批次的编辑（含改罐 / 改入罐量）。
+   * expectedRevision 是编辑窗口打开时记下的修订号；落后时底层抛 RevisionConflictError。
+   * force=true 表示用户已确认用自己的内容强制覆盖。
+   */
+  async function saveExistingBatch(
+    id: string,
+    draft: BatchDraft,
+    expectedRevision: number,
+    force = false
+  ): Promise<string> {
     error.value = null
-    if (patch.tankId && patch.tankId !== current.tankId) {
-      await assertTankAssignable(patch.tankId, id)
-      await updateTank(patch.tankId, { state: '在用' })
-      if (current.tankId) await updateTank(current.tankId, { state: '空闲' })
-    }
-    await updateBatchRow(id, patch)
+    return saveBatchRow(draft, id, expectedRevision, force)
   }
 
   async function deleteBatch(id: string): Promise<void> {
@@ -90,7 +84,7 @@ export const useBatchStore = defineStore('batch', () => {
     applyQuery,
     select,
     createBatch,
-    updateBatch,
+    saveExistingBatch,
     deleteBatch,
     ship
   }

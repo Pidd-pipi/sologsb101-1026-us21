@@ -8,6 +8,7 @@ import type { LocationQuery } from 'vue-router'
 import type { Parcel } from '@/types/parcel'
 import type { FilterModel } from '@/types/filter'
 import { putParcel, removeParcel, updateParcel as updateParcelRow, ROW_REVISION } from '@/utils/db'
+import { REVIEW_NORMAL } from '@/types/revision'
 import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
@@ -40,7 +41,14 @@ export const useParcelStore = defineStore('parcel', () => {
   async function createParcel(payload: Omit<Parcel, 'id'>): Promise<string> {
     const now = Date.now()
     const id = createId('parcel')
-    await putParcel({ ...payload, id, revision: ROW_REVISION, createdAt: now, updatedAt: now })
+    await putParcel({
+      ...payload,
+      id,
+      revision: ROW_REVISION,
+      reviewState: REVIEW_NORMAL,
+      createdAt: now,
+      updatedAt: now
+    })
     selectedId.value = id
     return id
   }

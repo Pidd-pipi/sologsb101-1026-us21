@@ -8,12 +8,23 @@ import StageTag from '@/components/common/StageTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
-import { db, type BatchRow, type ParcelRow, type ReadingRow, type TankRow } from '@/utils/db'
+import {
+  db,
+  RevisionConflictError,
+  saveReading,
+  type BatchDraft,
+  type BatchRow,
+  type ParcelRow,
+  type ReadingDraft,
+  type ReadingRow,
+  type TankRow
+} from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useFermentTrend } from '@/hooks/useFermentTrend'
 import { useBatchStore } from '@/stores/batchStore'
-import { BATCH_STATES, createEmptyBatch, type Batch } from '@/types/batch'
-import { OVER_TEMP_C, createEmptyReading, type Reading } from '@/types/reading'
+import { BATCH_STATES, createEmptyBatch } from '@/types/batch'
+import { OVER_TEMP_C, createEmptyReading } from '@/types/reading'
+import { REVIEW_PENDING } from '@/types/revision'
 import type { FilterSelectConfig, FilterModel } from '@/types/filter'
 import { filtersToQuery } from '@/utils/query'
 
@@ -82,6 +93,10 @@ function tankCode(tankId: string): string {
   return tanks.value.find((item) => item.id === tankId)?.code ?? '未知罐'
 }
 
+function formatTime(ms: number): string {
+  return new Date(ms).toLocaleString('zh-CN', { hour12: false })
+}
+
 /** 趋势条高度百分比（比重越大条越高） */
 function barHeight(gravity: number): number {
   const { min, max } = trend.range.value
@@ -92,7 +107,12 @@ function barHeight(gravity: number): number {
 /* ------------------------------ 入罐登记 ------------------------------ */
 const batchDialog = ref(false)
 const batchFormRef = ref<FormInstance>()
-const batchForm = reactive<Omit<Batch, 'id' | 'lastOperationAt'>>(createEmptyBatch())
+const batchForm = reactive(createEmptyBatch())
+/** 编辑时打开窗口记下的修订号；新建为 undefined */
+const batchEditingId = ref<string | null>(null)
+const batchBaseRevision = ref<number | undefined>(undefined)
+/** 保存时发现已被其他窗口改过：留住表单内容，等用户选择载入最新或强制覆盖 */
+const batchConflict = ref<RevisionConflictError | null>(null)
 
 const batchRules: FormRules = {
   parcelId: [{ required: true, message: '请选择地块', trigger: 'change' }],
@@ -100,34 +120,88 @@ const batchRules: FormRules = {
   volumeL: [{ required: true, message: '请填写入罐量', trigger: 'blur' }]
 }
 
-/** 可选罐位：状态非「清洗中」，且未被其它在罐批次占用 */
+/** 可选罐位：状态非「清洗中」，且未被其它在罐批次占用；容量不够入罐量的也灰掉并注明 */
 const assignableTanks = computed(() =>
-  tanks.value.filter((tank) => {
-    if (tank.state === '清洗中') return false
-    const occupied = batches.value.some(
-      (batch) => batch.tankId === tank.id && batch.state !== '已出罐' && batch.id !== store.currentBatchId
-    )
-    return !occupied
-  })
+  tanks.value
+    .filter((tank) => {
+      if (tank.state === '清洗中') return false
+      const occupied = batches.value.some(
+        (batch) =>
+          batch.tankId === tank.id &&
+          batch.state !== '已出罐' &&
+          batch.id !== batchEditingId.value
+      )
+      return !occupied
+    })
+    .map((tank) => ({
+      ...tank,
+      tooSmall: tank.capacityL < batchForm.volumeL
+    }))
 )
 
 function openCreateBatch(): void {
+  batchEditingId.value = null
+  batchBaseRevision.value = undefined
+  batchConflict.value = null
   Object.assign(batchForm, createEmptyBatch())
   const parcelFromQuery = typeof route.query.parcelId === 'string' ? route.query.parcelId : ''
   if (parcelFromQuery) batchForm.parcelId = parcelFromQuery
   batchDialog.value = true
 }
 
-async function submitBatch(): Promise<void> {
+function openEditBatch(batch: BatchRow): void {
+  batchEditingId.value = batch.id
+  // 记打开时的修订号：保存前拿它和库里的最新修订号比一次
+  batchBaseRevision.value = batch.revision
+  batchConflict.value = null
+  Object.assign(batchForm, {
+    parcelId: batch.parcelId,
+    tankId: batch.tankId,
+    harvestDate: batch.harvestDate,
+    volumeL: batch.volumeL,
+    brix: batch.brix,
+    state: batch.state
+  })
+  batchDialog.value = true
+}
+
+async function submitBatch(force = false): Promise<void> {
   const valid = await batchFormRef.value?.validate().catch(() => false)
   if (!valid) return
   try {
-    await store.createBatch({ ...batchForm })
-    ElMessage.success('批次已入罐，罐位置为「在用」')
+    const draft: BatchDraft = { ...batchForm }
+    if (batchEditingId.value && batchBaseRevision.value !== undefined) {
+      await store.saveExistingBatch(batchEditingId.value, draft, batchBaseRevision.value, force)
+    } else {
+      await store.createBatch(draft)
+    }
+    ElMessage.success(batchEditingId.value ? '批次已更新，罐位占用已按最新数字重算' : '批次已入罐，罐位置为「在用」')
+    batchConflict.value = null
     batchDialog.value = false
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '入罐失败')
+    if (error instanceof RevisionConflictError) {
+      // 不关闭弹窗、不清表单：把未提交的内容留住
+      batchConflict.value = error
+    } else {
+      ElMessage.error(error instanceof Error ? error.message : '入罐失败')
+    }
   }
+}
+
+/** 冲突后载入对方已保存的最新内容（用户可在其基础上再改） */
+function adoptLatestBatch(): void {
+  const latest = batchConflict.value?.latest as BatchRow | undefined
+  if (!latest) return
+  Object.assign(batchForm, {
+    parcelId: latest.parcelId,
+    tankId: latest.tankId,
+    harvestDate: latest.harvestDate,
+    volumeL: latest.volumeL,
+    brix: latest.brix,
+    state: latest.state
+  })
+  batchBaseRevision.value = batchConflict.value?.currentRevision
+  batchConflict.value = null
 }
 
 async function shipBatch(batch: BatchRow): Promise<void> {
@@ -159,7 +233,10 @@ async function removeBatch(batch: BatchRow): Promise<void> {
 /* ------------------------------ 读数录入 ------------------------------ */
 const readingDialog = ref(false)
 const readingFormRef = ref<FormInstance>()
-const readingForm = reactive<Omit<Reading, 'id'>>(createEmptyReading())
+const readingForm = reactive(createEmptyReading())
+const readingEditingId = ref<string | null>(null)
+const readingBaseRevision = ref<number | undefined>(undefined)
+const readingConflict = ref<RevisionConflictError | null>(null)
 
 const readingRules: FormRules = {
   date: [{ required: true, message: '请选择日期', trigger: 'change' }],
@@ -171,29 +248,67 @@ function openCreateReading(): void {
     ElMessage.warning('请先选择批次')
     return
   }
+  readingEditingId.value = null
+  readingBaseRevision.value = undefined
+  readingConflict.value = null
   Object.assign(readingForm, createEmptyReading())
   readingForm.batchId = currentBatch.value.id
   readingDialog.value = true
 }
 
-async function submitReading(): Promise<void> {
+/** 打开读数编辑：同时记下这一行当前的修订号 */
+function openEditReading(row: ReadingRow): void {
+  readingEditingId.value = row.id
+  readingBaseRevision.value = row.revision
+  readingConflict.value = null
+  Object.assign(readingForm, {
+    batchId: row.batchId,
+    date: row.date,
+    gravity: row.gravity,
+    tempC: row.tempC,
+    brix: row.brix
+  })
+  readingDialog.value = true
+}
+
+async function submitReading(force = false): Promise<void> {
   const valid = await readingFormRef.value?.validate().catch(() => false)
   if (!valid) return
-  const duplicate = batchReadings.value.some((row) => row.date === readingForm.date)
+  // 列表层先挡一次重复日期，真正的唯一性由保存事务兜底（另一窗口同时录入也挡得住）
+  const duplicate = batchReadings.value.some(
+    (row) => row.date === readingForm.date && row.id !== readingEditingId.value
+  )
   if (duplicate) {
     ElMessage.warning('该批次当日已有读数，请直接编辑已有记录')
     return
   }
-  const now = Date.now()
-  await db.readings.put({
-    ...readingForm,
-    id: `reading-${now.toString(36)}`,
-    revision: 1,
-    createdAt: now,
-    updatedAt: now
+  try {
+    const draft: ReadingDraft = { ...readingForm }
+    await saveReading(draft, readingEditingId.value, readingBaseRevision.value, force)
+    ElMessage.success(readingEditingId.value ? '读数已更新' : '读数已记录')
+    readingConflict.value = null
+    readingDialog.value = false
+  } catch (error) {
+    if (error instanceof RevisionConflictError) {
+      readingConflict.value = error
+    } else {
+      ElMessage.error(error instanceof Error ? error.message : '读数保存失败')
+    }
+  }
+}
+
+function adoptLatestReading(): void {
+  const latest = readingConflict.value?.latest as ReadingRow | undefined
+  if (!latest) return
+  Object.assign(readingForm, {
+    batchId: latest.batchId,
+    date: latest.date,
+    gravity: latest.gravity,
+    tempC: latest.tempC,
+    brix: latest.brix
   })
-  ElMessage.success('读数已记录')
-  readingDialog.value = false
+  readingBaseRevision.value = readingConflict.value?.currentRevision
+  readingConflict.value = null
 }
 
 async function removeReading(row: ReadingRow): Promise<void> {
@@ -285,13 +400,17 @@ watch(currentBatch, (batch) => {
               @click="store.select(batch.id)"
             >
               <div class="batch-item__head">
-                <span class="batch-item__name">{{ parcelName(batch.parcelId) }}</span>
+                <span class="batch-item__name">
+                  {{ parcelName(batch.parcelId) }}
+                  <el-tag v-if="batch.reviewState === REVIEW_PENDING" type="danger" size="small" effect="plain">待复核</el-tag>
+                </span>
                 <StageTag :value="batch.state" size="small" />
               </div>
               <div class="batch-item__meta">
                 {{ batch.harvestDate }} · {{ batch.volumeL }}L · {{ batch.brix }}°Bx · 罐 {{ tankCode(batch.tankId) }}
               </div>
               <div class="batch-item__actions">
+                <el-button link type="primary" size="small" @click.stop="openEditBatch(batch)">编辑</el-button>
                 <el-button link type="primary" size="small" @click.stop="shipBatch(batch)">出罐</el-button>
                 <el-button link type="danger" size="small" @click.stop="removeBatch(batch)">删除</el-button>
               </div>
@@ -358,7 +477,12 @@ watch(currentBatch, (batch) => {
             </div>
 
             <el-table :data="trend.points.value" stripe border class="mt">
-              <el-table-column prop="date" label="日期" width="120" />
+              <el-table-column label="日期" width="160">
+                <template #default="{ row }">
+                  {{ row.date }}
+                  <el-tag v-if="row.reviewState === REVIEW_PENDING" type="danger" size="small" effect="plain">待复核</el-tag>
+                </template>
+              </el-table-column>
               <el-table-column prop="gravity" label="比重" width="100" align="right" />
               <el-table-column prop="brix" label="糖度(°Bx)" width="110" align="right" />
               <el-table-column prop="tempC" label="温度(℃)" width="110" align="right">
@@ -371,8 +495,9 @@ watch(currentBatch, (batch) => {
               <el-table-column label="下降速率/日" width="130" align="right">
                 <template #default="{ row }">{{ row.declinePerDay }}</template>
               </el-table-column>
-              <el-table-column label="操作" width="90">
+              <el-table-column label="操作" width="130">
                 <template #default="{ row }">
+                  <el-button link type="primary" size="small" @click="openEditReading(row)">编辑</el-button>
                   <el-button link type="danger" size="small" @click="removeReading(row)">删除</el-button>
                 </template>
               </el-table-column>
@@ -382,7 +507,21 @@ watch(currentBatch, (batch) => {
       </el-col>
     </el-row>
 
-    <el-dialog v-model="batchDialog" title="新建入罐批次" width="560px">
+    <el-dialog v-model="batchDialog" :title="batchEditingId ? '编辑入罐批次' : '新建入罐批次'" width="560px">
+      <el-alert
+        v-if="batchConflict"
+        type="error"
+        :closable="false"
+        show-icon
+        class="mb"
+        title="这条批次记录已经被其他人改过"
+        :description="`对方保存于 ${formatTime(batchConflict.latestUpdatedAt)}（最新修订号 ${batchConflict.currentRevision}）。你填写的内容仍保留在表单里，可载入最新内容后再改，或强制以你的内容覆盖。`"
+      >
+        <div class="conflict-actions">
+          <el-button size="small" type="primary" @click="adoptLatestBatch">载入最新内容</el-button>
+          <el-button size="small" type="danger" plain @click="submitBatch(true)">仍以我的内容覆盖</el-button>
+        </div>
+      </el-alert>
       <el-form ref="batchFormRef" :model="batchForm" :rules="batchRules" label-width="100px">
         <el-form-item label="地块" prop="parcelId">
           <el-select v-model="batchForm.parcelId" class="full" placeholder="选择地块">
@@ -394,7 +533,8 @@ watch(currentBatch, (batch) => {
             <el-option
               v-for="item in assignableTanks"
               :key="item.id"
-              :label="`${item.code} · ${item.material} ${item.capacityL}L`"
+              :disabled="item.tooSmall"
+              :label="`${item.code} · ${item.material} ${item.capacityL}L${item.tooSmall ? `（容量不足，需 ≥ ${batchForm.volumeL}L）` : ''}`"
               :value="item.id"
             />
           </el-select>
@@ -411,11 +551,25 @@ watch(currentBatch, (batch) => {
       </el-form>
       <template #footer>
         <el-button @click="batchDialog = false">取消</el-button>
-        <el-button type="primary" @click="submitBatch">确认入罐</el-button>
+        <el-button type="primary" @click="submitBatch(false)">确认保存</el-button>
       </template>
     </el-dialog>
 
-    <el-dialog v-model="readingDialog" title="录入发酵读数" width="520px">
+    <el-dialog v-model="readingDialog" :title="readingEditingId ? '编辑发酵读数' : '录入发酵读数'" width="520px">
+      <el-alert
+        v-if="readingConflict"
+        type="error"
+        :closable="false"
+        show-icon
+        class="mb"
+        title="这条读数已经被其他人改过"
+        :description="`对方保存于 ${formatTime(readingConflict.latestUpdatedAt)}（最新修订号 ${readingConflict.currentRevision}）。你填写的内容仍保留在表单里，可载入最新内容后再改，或强制以你的内容覆盖。`"
+      >
+        <div class="conflict-actions">
+          <el-button size="small" type="primary" @click="adoptLatestReading">载入最新内容</el-button>
+          <el-button size="small" type="danger" plain @click="submitReading(true)">仍以我的内容覆盖</el-button>
+        </div>
+      </el-alert>
       <el-form ref="readingFormRef" :model="readingForm" :rules="readingRules" label-width="100px">
         <el-form-item label="日期" prop="date">
           <el-date-picker v-model="readingForm.date" type="date" value-format="YYYY-MM-DD" class="full" />
@@ -432,7 +586,7 @@ watch(currentBatch, (batch) => {
       </el-form>
       <template #footer>
         <el-button @click="readingDialog = false">取消</el-button>
-        <el-button type="primary" @click="submitReading">保存读数</el-button>
+        <el-button type="primary" @click="submitReading(false)">保存读数</el-button>
       </template>
     </el-dialog>
   </div>
@@ -449,6 +603,12 @@ watch(currentBatch, (batch) => {
 
 .mt {
   margin-top: 12px;
+}
+
+.conflict-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
 }
 
 .metric-row {
@@ -489,6 +649,9 @@ watch(currentBatch, (batch) => {
 
 .batch-item__name {
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .batch-item__meta {

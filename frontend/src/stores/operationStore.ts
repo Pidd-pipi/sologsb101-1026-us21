@@ -1,5 +1,6 @@
 /**
  * 作业 store：维护作业顺序、完成态与作业类型筛选。
+ * 新建 / 编辑保存统一走 db.saveOperation：乐观锁 + 事务内复核目标罐容量。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
@@ -8,14 +9,11 @@ import type { Operation } from '@/types/operation'
 import type { FilterModel } from '@/types/filter'
 import {
   completeOperation,
-  nextOperationSeq,
-  putOperation,
   removeOperation,
   reorderOperations,
-  updateOperation as updateOperationRow,
-  ROW_REVISION
+  saveOperation as saveOperationRow,
+  type OperationDraft
 } from '@/utils/db'
-import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
 export const OPERATION_FILTER_KEYS = ['types', 'states']
@@ -43,18 +41,19 @@ export const useOperationStore = defineStore('operation', () => {
     currentBatchId.value = id
   }
 
+  /** 排入作业：事务内按最新罐容量 / 入罐量复核，容量不够当场拒绝 */
   async function createOperation(payload: Omit<Operation, 'id' | 'seq'>): Promise<string> {
-    if (!payload.batchId) throw new Error('请选择批次')
-    if (!payload.operator.trim()) throw new Error('请填写操作人')
-    const seq = await nextOperationSeq(payload.batchId)
-    const now = Date.now()
-    const id = createId('operation')
-    await putOperation({ ...payload, id, seq, revision: ROW_REVISION, createdAt: now, updatedAt: now })
-    return id
+    return saveOperationRow(payload, null, undefined)
   }
 
-  async function updateOperation(id: string, patch: Partial<Operation>): Promise<void> {
-    await updateOperationRow(id, patch)
+  /** 保存编辑：expectedRevision 为打开编辑时记下的修订号，落后时抛 RevisionConflictError */
+  async function saveExistingOperation(
+    id: string,
+    draft: OperationDraft,
+    expectedRevision: number,
+    force = false
+  ): Promise<string> {
+    return saveOperationRow(draft, id, expectedRevision, force)
   }
 
   async function deleteOperation(id: string): Promise<void> {
@@ -83,7 +82,7 @@ export const useOperationStore = defineStore('operation', () => {
     applyQuery,
     select,
     createOperation,
-    updateOperation,
+    saveExistingOperation,
     deleteOperation,
     finish,
     move

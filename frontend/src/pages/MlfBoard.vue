@@ -138,6 +138,7 @@ async function createPlaceholder(batchId: string): Promise<void> {
     malicG: MALIC_START_G,
     state: '未启动',
     revision: 1,
+    reviewState: '正常',
     createdAt: now,
     updatedAt: now
   })

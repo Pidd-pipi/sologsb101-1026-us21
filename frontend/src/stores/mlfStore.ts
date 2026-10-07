@@ -9,6 +9,7 @@ import { MALIC_DONE_THRESHOLD, MALIC_START_G } from '@/types/mlf'
 import type { FilterModel } from '@/types/filter'
 import type { MlfRow } from '@/utils/db'
 import { putMlf, removeMlf, updateBatch, updateMlf as updateMlfRow, ROW_REVISION } from '@/utils/db'
+import { REVIEW_NORMAL } from '@/types/revision'
 import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 import { today } from '@/utils/uuid'
@@ -52,6 +53,7 @@ export const useMlfStore = defineStore('mlf', () => {
         malicG: MALIC_START_G,
         state: '进行中',
         revision: ROW_REVISION,
+        reviewState: REVIEW_NORMAL,
         createdAt: now,
         updatedAt: now
       })
